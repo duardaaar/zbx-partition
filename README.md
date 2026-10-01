@@ -24,23 +24,36 @@ Executado em laboratório com Zabbix 7.0 LTS em **dois servidores Ubuntu 26.04**
 
 Execução completa do `init`, sem contar a confirmação manual: **cerca de 5 segundos** (3 s de análise + 2 s para converter as 4 tabelas, desativar o housekeeper e rodar a manutenção), sem perda de dados.
 
+### Ajuste do housekeeper (`housekeeping`)
+
 ```
-[INFO] history: convertendo...
-[INFO] history: convertida.
-[INFO] history_uint: convertendo...
-[INFO] history_uint: convertida.
-[INFO] trends: convertendo...
-[INFO] trends: convertida.
-[INFO] trends_uint: convertendo...
-[INFO] trends_uint: convertida.
-[INFO] Confirmado: housekeeper de history e trends desativado.
-[INFO] Particionamento concluído. Pode iniciar o Zabbix server (systemctl start zabbix-server).
+[INFO] Comando: housekeeping | banco: zabbix@localhost:5432/zabbix
+[AVISO] ZBX_API_URL/ZBX_API_TOKEN não configurados; atualizando o housekeeper direto no banco (tabela config).
+[INFO] Confirmado: housekeeper de history e trends desativado; override de período ativo (history 90d, trends 90d).
+[AVISO] Com o housekeeper desativado, a tabela history_str (não particionada) deixa de ser limpa e cresce sem limite. Para incluí-la, adicione em ZBX_PART_HISTORY_TABLES.
+[AVISO] Com o housekeeper desativado, a tabela history_text (não particionada) deixa de ser limpa e cresce sem limite. Para incluí-la, adicione em ZBX_PART_HISTORY_TABLES.
+[AVISO] Com o housekeeper desativado, a tabela history_log (não particionada) deixa de ser limpa e cresce sem limite. Para incluí-la, adicione em ZBX_PART_HISTORY_TABLES.
+[AVISO] Com o housekeeper desativado, a tabela history_bin (não particionada) deixa de ser limpa e cresce sem limite. Para incluí-la, adicione em ZBX_PART_HISTORY_TABLES.
+
 ```
 
 ### Estado após a conversão (`status`)
 
 ```
-COLE AQUI A SAÍDA DE: sudo bash zbx-partition.bash status
+TABELA        PARTIÇÕES  MAIS ANTIGA               MAIS NOVA                 TAMANHO
+history       9          history_p2026_09_29       history_p2026_10_07       4680 kB
+history_uint  9          history_uint_p2026_09_29  history_uint_p2026_10_07  2088 kB
+trends        9          trends_p2026_09_29        trends_p2026_10_07        216 kB
+trends_uint   9          trends_uint_p2026_09_29   trends_uint_p2026_10_07   184 kB
+
+Housekeeper (0 = desativado): history=0 trends=0
+Override de período (1 = ativo): history=1 (90d) trends=1 (90d)
+Retenção: history 90 dias | trends 90 dias
+Partições (diárias) criadas com antecedência: history 7 dias | trends 7 dias
+
+NEXT                        LEFT LAST PASSED UNIT                ACTIVATES
+Thu 2026-10-01 03:33:23 -03  20h -         - zbx-partition.timer zbx-partition.service
+
 ```
 
 > ℹ️ O laboratório tinha poucos dados (instalação recente). Em produção, o tempo do `init` cresce com o tamanho das tabelas — rode o `--dry-run` para ver o tamanho de cada uma e planeje a janela de manutenção.
@@ -77,7 +90,7 @@ Com particionamento, cada dia de dados fica em uma tabela própria (partição).
 1. **Conversão (uma única vez):** as tabelas viram tabelas particionadas por **range na coluna `clock`** (epoch em inteiro), com uma partição por dia.
 2. **Partições futuras:** o script mantém sempre **7 dias à frente** já criados. Se o agendamento falhar por alguns dias, o Zabbix continua gravando normalmente.
 3. **Retenção:** a cada execução, toda partição cujo dia terminou há mais de **90 dias** é apagada.
-4. **Housekeeper desativado:** o housekeeper de history e trends é desligado, para não concorrer com o particionamento.
+4. **Housekeeper desativado:** o housekeeper de history e trends é desligado, para não concorrer com o particionamento, e o **override de período** é ativado com a mesma retenção, para os gráficos escolherem corretamente entre history e trends.
 5. **Agendamento:** um **systemd timer** roda a manutenção todos os dias às 03:30.
 
 Exemplo com retenção de 90 dias, executando em 30/09/2026:
@@ -142,8 +155,8 @@ O tempo do `init` é proporcional ao volume de dados copiados. No laboratório (
 **1. Clone o repositório no servidor de banco**
 
 ```bash
-git clone https://github.com/duardaaar/zbx-partition.git
-cd zbx-partition
+git clone https://github.com/<seu-usuario>/<seu-repositorio>.git
+cd <seu-repositorio>
 ```
 
 **2. Crie o `.env`**
@@ -353,9 +366,27 @@ Para particioná-las também, inclua-as na variável e rode o `init` de novo (co
 ZBX_PART_HISTORY_TABLES=history history_uint history_str history_text history_log history_bin
 ```
 
-### A retenção dos itens deixa de valer
+### Override do período de history e trends
 
-O "History storage period" e o "Trend storage period" configurados em cada item ou template **não são mais aplicados**. Quem manda é a retenção das partições (`ZBX_PART_HISTORY_DAYS` e `ZBX_PART_TRENDS_DAYS`).
+O "History storage period" e o "Trend storage period" configurados em cada item **não são mais aplicados**: quem apaga os dados é a retenção das partições.
+
+Mas o frontend ainda usa o período de history do item para decidir, nos gráficos, se busca os dados em **history** ou em **trends**. Sem ajuste, isso gera inconsistências:
+
+| Período no item | Retenção real | Problema |
+|-----------------|---------------|----------|
+| 31 dias (padrão) | 90 dias      | Gráfico de 60 dias atrás usa trends, embora a history ainda exista |
+| 365 dias         | 90 dias      | Gráfico de 100 dias atrás busca history que já foi apagada e aparece vazio |
+
+Por isso, o comando `housekeeping` (executado também pelo `init`) ativa o **"Override item history period"** e o **"Override item trend period"** com os mesmos valores da retenção das partições. Assim, todos os itens passam a usar 90 dias e os gráficos refletem o que realmente existe no banco.
+
+Se você mudar a retenção no `.env`, rode novamente:
+
+```bash
+sudo bash zbx-partition.bash housekeeping
+sudo bash zbx-partition.bash install-timer   # atualiza a cópia do .env usada pelo timer
+```
+
+O `maintain` diário avisa no log se o override estiver diferente da retenção.
 
 ### Horário das partições em UTC
 
