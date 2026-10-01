@@ -9,8 +9,47 @@ Script em Bash que converte as tabelas de histórico do Zabbix para **particiona
 
 ---
 
+## Resultado
+
+Executado em laboratório com Zabbix 7.0 LTS em **dois servidores Ubuntu 26.04** (aplicação e banco PostgreSQL separados).
+
+### Conversão (`init`)
+
+| Tabela         | Linhas | Partições criadas | Tempo de conversão |
+|----------------|-------:|------------------:|-------------------:|
+| `history`      | 18.606 | 9                 | < 1 s              |
+| `history_uint` |  7.951 | 9                 | < 1 s              |
+| `trends`       |    440 | 9                 | < 1 s              |
+| `trends_uint`  |    193 | 9                 | < 1 s              |
+
+Execução completa do `init`, sem contar a confirmação manual: **cerca de 5 segundos** (3 s de análise + 2 s para converter as 4 tabelas, desativar o housekeeper e rodar a manutenção), sem perda de dados.
+
+```
+[INFO] history: convertendo...
+[INFO] history: convertida.
+[INFO] history_uint: convertendo...
+[INFO] history_uint: convertida.
+[INFO] trends: convertendo...
+[INFO] trends: convertida.
+[INFO] trends_uint: convertendo...
+[INFO] trends_uint: convertida.
+[INFO] Confirmado: housekeeper de history e trends desativado.
+[INFO] Particionamento concluído. Pode iniciar o Zabbix server (systemctl start zabbix-server).
+```
+
+### Estado após a conversão (`status`)
+
+```
+COLE AQUI A SAÍDA DE: sudo bash zbx-partition.bash status
+```
+
+> ℹ️ O laboratório tinha poucos dados (instalação recente). Em produção, o tempo do `init` cresce com o tamanho das tabelas — rode o `--dry-run` para ver o tamanho de cada uma e planeje a janela de manutenção.
+
+---
+
 ## Sumário
 
+- [Resultado](#resultado)
 - [Por que particionar](#por-que-particionar)
 - [Como funciona](#como-funciona)
 - [Requisitos](#requisitos)
@@ -61,6 +100,28 @@ Nomes das partições: `history_p2026_09_30`, `trends_uint_p2026_10_01`, etc.
 - `psql` (pacote `postgresql-client`) e `flock` (pacote `util-linux`), já presentes no servidor de banco
 - Conexão com o usuário **dono das tabelas** (normalmente `zabbix`) — o script recusa outro usuário, porque o Zabbix perderia permissão nas tabelas novas
 - Acesso `root`/`sudo` para instalar o timer
+- **Espaço livre em disco** no servidor de banco de pelo menos o **tamanho da maior tabela a converter + 20%** (veja abaixo)
+- **Janela de manutenção**: o Zabbix server fica parado durante o `init`
+
+### Espaço em disco durante o `init`
+
+Durante a conversão de cada tabela, a versão antiga e a nova existem ao mesmo tempo, até a transação terminar. Como as tabelas são convertidas **uma de cada vez** e a antiga é apagada no fim de cada uma, o pico de uso é o tamanho da **maior** tabela (normalmente `history_uint`), mais a folga para o WAL gerado pela cópia.
+
+O `init` mostra o tamanho de cada tabela, calcula o espaço necessário e **para antes de alterar qualquer coisa** se o disco não for suficiente (quando o banco está na mesma máquina). Para ver os números sem alterar nada:
+
+```bash
+sudo bash zbx-partition.bash init --dry-run
+```
+
+Para conferir manualmente o tamanho das tabelas:
+
+```bash
+sudo -u postgres psql zabbix -c "SELECT relname, pg_size_pretty(pg_total_relation_size(oid)) FROM pg_class WHERE relname IN ('history','history_uint','trends','trends_uint');"
+```
+
+### Tempo de conversão
+
+O tempo do `init` é proporcional ao volume de dados copiados. No laboratório (cerca de 27 mil linhas) a conversão levou menos de 1 segundo; o script informa o tempo de cada tabela ao final. Em bancos grandes, faça o `init` primeiro em uma cópia do banco para medir o tempo da sua janela de manutenção.
 
 > 💡 Tire um **snapshot ou backup do banco** antes do `init`. A conversão altera a estrutura das tabelas.
 
@@ -215,7 +276,7 @@ sudo bash zbx-partition.bash <comando> [opções]
 | `--dry-run`     | Mostra o SQL e as ações **sem executar nada**                |
 | `--env ARQUIVO` | Usa outro arquivo de parâmetros                              |
 | `--yes`         | Não pede confirmação no `init`                               |
-| `--force`       | Roda o `init` mesmo com outras conexões ativas no banco      |
+| `--force`       | Roda o `init` mesmo com outras conexões ativas no banco ou pouco espaço em disco |
 
 Sem comando, o script apenas mostra a ajuda.
 
@@ -234,12 +295,15 @@ Tudo em **uma transação por tabela** — se der erro, aquela tabela volta ao e
 Proteções:
 
 - Recusa rodar com outras conexões no banco (Zabbix server ligado), salvo com `--force`
+- Recusa rodar sem espaço livre suficiente em disco, salvo com `--force`
 - Recusa rodar se o usuário da conexão não for o dono das tabelas
 - Tabelas já particionadas são ignoradas — rodar o `init` de novo é seguro
 
-### `maintain` é idempotente
+### `maintain` é idempotente e transacional
 
 Ele só cria as partições que faltam e só apaga as que venceram. Rodar várias vezes no mesmo dia não muda nada.
+
+As alterações de cada tabela rodam em **uma transação**: se algum comando falhar, nenhuma partição daquela tabela é criada nem apagada.
 
 ---
 
@@ -312,6 +376,10 @@ sudo bash zbx-partition.bash housekeeping
 ### `Há N outra(s) conexão(ões) no banco`
 
 O Zabbix server (ou o frontend) está conectado. Pare o `zabbix-server` no servidor da aplicação. Se o frontend continuar conectado, pare também o `php*-fpm` durante o `init`.
+
+### `Espaço livre insuficiente`
+
+O disco do banco não comporta a cópia da maior tabela. Libere espaço (ou aumente o disco) e rode o `init` de novo. Nada foi alterado.
 
 ### `pertence a 'X', mas a conexão usa 'Y'`
 
