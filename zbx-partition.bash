@@ -20,6 +20,7 @@
 #     --env ARQUIVO   arquivo de parâmetros (padrão: .env ao lado do script)
 #     --yes           não pede confirmação no init
 #     --force         roda o init mesmo com outras conexões ativas no banco
+#                     ou com pouco espaço livre em disco
 #
 #  Exemplos:
 #     sudo bash zbx-partition.bash init --dry-run
@@ -39,7 +40,8 @@ SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 ENV_FILE="${SCRIPT_DIR}/.env"
 CMD=""; DRY_RUN=0; ASSUME_YES=0; FORCE=0
 
-usage() { sed -n "3,/^# ====/p" "$SCRIPT_PATH"; }
+# Mostra o cabeçalho como ajuda, com o nome real do arquivo nos exemplos
+usage() { sed -n "3,/^# ====/p" "$SCRIPT_PATH" | sed "s|zbx-partition\.bash|$(basename "$SCRIPT_PATH")|g"; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -150,7 +152,7 @@ exec_sql() {  # executa um bloco de SQL; no --dry-run apenas mostra
     printf '%s\n' "$sql" >>"$LOG_FILE"
     if ! out=$(printf '%s\n' "$sql" | psql -X -q -v ON_ERROR_STOP=1 2>&1); then
         printf '%s\n' "$out" | tee -a "$LOG_FILE" >&2
-        fatal "Erro ao executar o SQL acima. Nada foi alterado nesta etapa (transação desfeita)."
+        fatal "Erro ao executar o SQL acima. A transação desta etapa foi desfeita; nada foi alterado nela."
     fi
 }
 
@@ -231,9 +233,12 @@ maintain_table() {
         info "$t: nada a fazer (retenção $(retention "$group") dias; mantém dados desde $(fmt_date "$co"))."
         return 0
     fi
-    local sql="-- ${t}: ${n_new} partição(ões) nova(s), ${n_drop} vencida(s)"
+    # Uma transação por tabela: se um comando falhar, nenhuma partição é
+    # criada nem apagada nesta tabela.
+    local sql="-- ${t}: ${n_new} partição(ões) nova(s), ${n_drop} vencida(s)"$'\n'"BEGIN;"
     if [[ -n "$creates" ]]; then sql+=$'\n'"$creates"; fi
     if [[ -n "$drops" ]];   then sql+=$'\n'"${drops%$'\n'}"; fi
+    sql+=$'\n'"COMMIT;"
     exec_sql "$sql"
     if [[ $DRY_RUN -eq 1 ]]; then
         info "$t: ${n_new} partição(ões) seriam criadas, ${n_drop} seriam apagadas.${dropped:+ Vencidas:$dropped}"
@@ -313,6 +318,43 @@ cmd_housekeeping() {
 # -----------------------------------------------------------------------------
 declare -A INIT_SQL=()
 INIT_ORDER=()
+MAX_TABLE_BYTES=0   # maior tabela a converter (pico de espaço em disco no init)
+MAX_TABLE_NAME=""
+
+pretty_bytes() { q "SELECT pg_size_pretty(${1}::bigint)"; }
+
+# Na conversão, a tabela antiga e a nova coexistem até o COMMIT. Como cada
+# tabela é convertida e confirmada separadamente, o pico de uso é o tamanho
+# da MAIOR tabela (mais folga para o WAL gerado pela cópia).
+check_disk_space() {
+    [[ $MAX_TABLE_BYTES -gt 0 ]] || return 0
+    local need=$(( MAX_TABLE_BYTES * 12 / 10 )) dir="" avail=""
+    info "Espaço livre necessário no disco do banco: ~$(pretty_bytes "$need") (maior tabela: ${MAX_TABLE_NAME} com $(pretty_bytes "$MAX_TABLE_BYTES"), +20% para o WAL)."
+
+    # Só dá para medir o disco quando o PostgreSQL está nesta máquina
+    if [[ "$ZBX_DB_HOST" == localhost || "$ZBX_DB_HOST" == 127.0.0.1 || "$ZBX_DB_HOST" == ::1 || "$ZBX_DB_HOST" == /* ]]; then
+        dir=$(psql -X -qtA -c "SHOW data_directory" 2>/dev/null || true)
+        if [[ -z "$dir" && $EUID -eq 0 ]] && command -v sudo >/dev/null; then
+            dir=$(sudo -u postgres psql -X -qtA -c "SHOW data_directory" 2>/dev/null || true)
+        fi
+        if [[ -n "$dir" && -d "$dir" ]]; then
+            avail=$(df -PB1 "$dir" | awk 'NR==2 {print $4}')
+        fi
+    fi
+
+    if [[ ! "$avail" =~ ^[0-9]+$ ]]; then
+        warn "Não foi possível medir o espaço livre (banco remoto ou sem permissão). Confirme manualmente antes de continuar."
+        return 0
+    fi
+    info "Espaço livre em ${dir}: $(pretty_bytes "$avail")."
+    if [[ $avail -lt $need ]]; then
+        if [[ $FORCE -eq 1 || $DRY_RUN -eq 1 ]]; then
+            warn "Espaço livre insuficiente para a conversão com segurança."
+        else
+            fatal "Espaço livre insuficiente: há $(pretty_bytes "$avail"), são necessários ~$(pretty_bytes "$need"). Libere espaço ou use --force por sua conta e risco."
+        fi
+    fi
+}
 
 check_connections() {
     local n list
@@ -359,6 +401,9 @@ plan_table() {
     idxdefs=$(q "SELECT pg_get_indexdef(indexrelid) || ';' FROM pg_index WHERE indrelid = '${t}'::regclass AND NOT indisprimary")
 
     info "$t: analisando dados existentes..."
+    local size_b
+    size_b=$(q "SELECT pg_total_relation_size('${t}')")
+    if [[ $size_b -gt $MAX_TABLE_BYTES ]]; then MAX_TABLE_BYTES=$size_b; MAX_TABLE_NAME=$t; fi
     co=$(cutoff "$group")
     IFS='|' read -r minc maxc total <<<"$(q "SELECT COALESCE(min(clock),0) || '|' || COALESCE(max(clock),0) || '|' || count(*) FROM ${t}")"
 
@@ -412,7 +457,7 @@ COMMIT;"
 
     INIT_SQL[$t]="$sql"
     INIT_ORDER+=("$t")
-    info "$t: ${total} linha(s); ${n_parts} partição(ões) de $(fmt_date "$first_s") até $(fmt_date "$to")."
+    info "$t: ${total} linha(s), $(pretty_bytes "$size_b"); ${n_parts} partição(ões) de $(fmt_date "$first_s") até $(fmt_date "$to")."
     if [[ $old_rows -gt 0 ]]; then
         warn "$t: ${old_rows} linha(s) mais antiga(s) que a retenção ($(retention "$group") dias) serão descartadas."
     fi
@@ -428,6 +473,7 @@ cmd_init() {
     if [[ ${#INIT_ORDER[@]} -eq 0 ]]; then
         info "Nenhuma tabela para converter."
     else
+        check_disk_space
         if [[ $DRY_RUN -eq 0 && $ASSUME_YES -eq 0 ]]; then
             [[ -t 0 ]] || fatal "Confirmação necessária: rode em um terminal ou use --yes."
             echo
@@ -436,12 +482,15 @@ cmd_init() {
             read -rp "Digite PARTICIONAR para continuar: " ans
             [[ "$ans" == "PARTICIONAR" ]] || { echo "Cancelado."; exit 0; }
         fi
-        local t
+        local t t0 t_start
+        t_start=$(date +%s)
         for t in "${INIT_ORDER[@]}"; do
+            t0=$(date +%s)
             [[ $DRY_RUN -eq 1 ]] || info "$t: convertendo..."
             exec_sql "${INIT_SQL[$t]}"
-            [[ $DRY_RUN -eq 1 ]] || info "$t: convertida."
+            [[ $DRY_RUN -eq 1 ]] || info "$t: convertida em $(( $(date +%s) - t0 ))s."
         done
+        [[ $DRY_RUN -eq 1 ]] || info "Conversão de ${#INIT_ORDER[@]} tabela(s) concluída em $(( $(date +%s) - t_start ))s."
     fi
 
     cmd_housekeeping
