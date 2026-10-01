@@ -10,7 +10,8 @@
 #     init            converte as tabelas para particionadas (uma única vez),
 #                     cria as partições e desativa o housekeeper
 #     maintain        cria partições futuras e apaga as vencidas (usado pelo timer)
-#     housekeeping    desativa o housekeeper de history/trends (API ou SQL)
+#     housekeeping    desativa o housekeeper de history/trends e ativa o
+#                     override de período com a retenção das partições
 #     status          mostra partições, tamanhos, housekeeper e timer
 #     install-timer   instala o systemd timer que roda "maintain" todo dia
 #     remove-timer    remove o systemd timer
@@ -253,15 +254,28 @@ cmd_maintain() {
 }
 
 # -----------------------------------------------------------------------------
-# housekeeping: desativa o housekeeper de history e trends
+# housekeeping: desativa o housekeeper de history e trends e ativa o
+# "Override item history/trend period" com a mesma retenção das partições.
+#
+# Sem o override, cada item mantém o próprio período de history (padrão 31d)
+# e os gráficos escolhem entre history e trends com base nele, não no que
+# realmente existe no banco. Com o override, todos os itens usam a retenção
+# das partições.
 # -----------------------------------------------------------------------------
-hk_modes() { q "SELECT hk_history_mode || '|' || hk_trends_mode FROM config"; }
+# Estado atual: modo_history|modo_trends|override_history|periodo_history|override_trends|periodo_trends
+hk_state()    { q "SELECT hk_history_mode || '|' || hk_trends_mode || '|' || hk_history_global || '|' || hk_history || '|' || hk_trends_global || '|' || hk_trends FROM config"; }
+hk_expected() { echo "0|0|1|${ZBX_PART_HISTORY_DAYS}d|1|${ZBX_PART_TRENDS_DAYS}d"; }
 
 check_housekeeper() {
-    local modes
-    modes=$(hk_modes)
-    if [[ "$modes" != "0|0" ]]; then
-        warn "O housekeeper de history/trends está ATIVO (history|trends = ${modes}). Ele concorre com o particionamento: rode '$0 housekeeping'."
+    local st mode_h mode_t glob_h per_h glob_t per_t
+    st=$(hk_state)
+    [[ "$st" == "$(hk_expected)" ]] && return 0
+    IFS='|' read -r mode_h mode_t glob_h per_h glob_t per_t <<<"$st"
+    if [[ "$mode_h" != 0 || "$mode_t" != 0 ]]; then
+        warn "O housekeeper de history/trends está ATIVO (history=${mode_h}, trends=${mode_t}). Ele concorre com o particionamento: rode '$0 housekeeping'."
+    fi
+    if [[ "$glob_h" != 1 || "$per_h" != "${ZBX_PART_HISTORY_DAYS}d" || "$glob_t" != 1 || "$per_t" != "${ZBX_PART_TRENDS_DAYS}d" ]]; then
+        warn "O override de período no Zabbix (history=${per_h} ativo=${glob_h}, trends=${per_t} ativo=${glob_t}) não bate com a retenção das partições (${ZBX_PART_HISTORY_DAYS}d/${ZBX_PART_TRENDS_DAYS}d). Os gráficos podem escolher a fonte errada: rode '$0 housekeeping'."
     fi
 }
 
@@ -277,8 +291,8 @@ warn_unpartitioned_history() {
 }
 
 cmd_housekeeping() {
-    local body resp
-    body='{"jsonrpc":"2.0","method":"housekeeping.update","params":{"hk_history_mode":0,"hk_trends_mode":0},"id":1}'
+    local body resp hk_h="${ZBX_PART_HISTORY_DAYS}d" hk_t="${ZBX_PART_TRENDS_DAYS}d"
+    body='{"jsonrpc":"2.0","method":"housekeeping.update","params":{"hk_history_mode":0,"hk_trends_mode":0,"hk_history_global":1,"hk_history":"'"$hk_h"'","hk_trends_global":1,"hk_trends":"'"$hk_t"'"},"id":1}'
     local api_ok=0
 
     if [[ -n "$ZBX_API_URL" && -n "$ZBX_API_TOKEN" ]]; then
@@ -290,24 +304,26 @@ cmd_housekeeping() {
                          -H "Authorization: Bearer ${ZBX_API_TOKEN}" -d "$body")
         if [[ "$ZBX_API_INSECURE" == yes ]]; then curl_opts+=(-k); fi
         if resp=$(curl "${curl_opts[@]}" "$ZBX_API_URL" 2>&1) && grep -q '"result"' <<<"$resp"; then
-            info "Housekeeper de history/trends desativado via API."
+            info "Housekeeper atualizado via API."
             api_ok=1
         else
             warn "A API não confirmou a alteração: ${resp}"
             warn "Aplicando pelo banco de dados como alternativa."
         fi
     else
-        warn "ZBX_API_URL/ZBX_API_TOKEN não configurados; desativando o housekeeper direto no banco (tabela config)."
+        warn "ZBX_API_URL/ZBX_API_TOKEN não configurados; atualizando o housekeeper direto no banco (tabela config)."
     fi
 
     if [[ $api_ok -eq 0 ]]; then
-        exec_sql "UPDATE config SET hk_history_mode = 0, hk_trends_mode = 0;"
+        exec_sql "UPDATE config SET hk_history_mode = 0, hk_trends_mode = 0,
+       hk_history_global = 1, hk_history = '${hk_h}',
+       hk_trends_global = 1, hk_trends = '${hk_t}';"
     fi
     if [[ $DRY_RUN -eq 0 ]]; then
-        if [[ "$(hk_modes)" == "0|0" ]]; then
-            info "Confirmado: housekeeper de history e trends desativado."
+        if [[ "$(hk_state)" == "$(hk_expected)" ]]; then
+            info "Confirmado: housekeeper de history e trends desativado; override de período ativo (history ${hk_h}, trends ${hk_t})."
         else
-            warn "O housekeeper ainda aparece ativo no banco. Verifique em Administração → Housekeeping."
+            warn "A configuração do housekeeper não ficou como esperado ($(hk_state)). Verifique em Administration → Housekeeping."
         fi
     fi
     warn_unpartitioned_history
@@ -523,9 +539,10 @@ cmd_status() {
     if command -v column >/dev/null; then fmt=(column -t -s'|'); fi
     { echo "TABELA|PARTIÇÕES|MAIS ANTIGA|MAIS NOVA|TAMANHO"; each_table status_table; } | "${fmt[@]}"
     echo
-    local modes
-    modes=$(hk_modes)
-    echo "Housekeeper (0 = desativado): history=${modes%%|*} trends=${modes##*|}"
+    local mode_h mode_t glob_h per_h glob_t per_t
+    IFS='|' read -r mode_h mode_t glob_h per_h glob_t per_t <<<"$(hk_state)"
+    echo "Housekeeper (0 = desativado): history=${mode_h} trends=${mode_t}"
+    echo "Override de período (1 = ativo): history=${glob_h} (${per_h}) trends=${glob_t} (${per_t})"
     echo "Retenção: history ${ZBX_PART_HISTORY_DAYS} dias | trends ${ZBX_PART_TRENDS_DAYS} dias"
     echo "Partições (diárias) criadas com antecedência: history ${ZBX_PART_HISTORY_PREMAKE} dias | trends ${ZBX_PART_TRENDS_PREMAKE} dias"
     echo
